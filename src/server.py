@@ -1069,9 +1069,9 @@ def _build_app():
     x402_server.register(config.X402_NETWORK, AggrDeferredEvmScheme())
 
     pay_to = creds[config.PAY_TO_ADDRESS_ENV]
-    price = f"${config.PAID_PRICE_USDT}"
 
-    def options():
+    def options(price_usdt):
+        price = f"${price_usdt}"
         return [
             PaymentOption(
                 scheme="exact", price=price, network=config.X402_NETWORK, pay_to=pay_to
@@ -1086,22 +1086,22 @@ def _build_app():
 
     routes = {
         f"GET {config.PAID_SCAN_PATH}": RouteConfig(
-            accepts=options(),
+            accepts=options(config.PAID_PRICE_SCAN_USDT),
             description="Live YouTube niche scan: saturation, outliers, ENTER/CROWDED/AVOID verdict",
             mime_type="application/json",
         ),
         f"GET {config.PAID_CHANNEL_PATH}": RouteConfig(
-            accepts=options(),
+            accepts=options(config.PAID_PRICE_CHANNEL_USDT),
             description="Live YouTube channel outlier audit vs the channel's own baseline",
             mime_type="application/json",
         ),
         f"GET {config.PAID_VIDEO_PATH}": RouteConfig(
-            accepts=options(),
+            accepts=options(config.PAID_PRICE_VIDEO_USDT),
             description="Explain any YouTube video's performance vs its own channel's baseline",
             mime_type="application/json",
         ),
         f"GET {config.PAID_RADAR_PATH}": RouteConfig(
-            accepts=options(),
+            accepts=options(config.PAID_PRICE_RADAR_USDT),
             description="Fastest-rising channels in a YouTube niche by recent-vs-lifetime momentum",
             mime_type="application/json",
         ),
@@ -1109,10 +1109,13 @@ def _build_app():
     application.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
     _payment_mode = "enforced"
     log.info(
-        "x402 payments enabled: %s per call on %s, pay-to %s",
-        price,
+        "x402 payments enabled on %s, pay-to %s (scan %s / channel %s / video %s / radar %s USDT)",
         config.X402_NETWORK,
         pay_to,
+        config.PAID_PRICE_SCAN_USDT,
+        config.PAID_PRICE_CHANNEL_USDT,
+        config.PAID_PRICE_VIDEO_USDT,
+        config.PAID_PRICE_RADAR_USDT,
     )
     return application
 

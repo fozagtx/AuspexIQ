@@ -60,15 +60,15 @@ them in your host's dashboard — the server reads the process environment):
 
 ## Paid endpoints (x402)
 
-Alongside the free MCP surface, the server exposes two x402-gated REST
-endpoints priced at **0.1 USDT per call** (X Layer, OKX Agent Payments
-Protocol). Calling one without payment returns `HTTP 402` with a
-`PAYMENT-REQUIRED` challenge; x402-capable agents pay and retry automatically:
+Alongside the free MCP surface, the server exposes four x402-gated REST
+endpoints (X Layer, OKX Agent Payments Protocol). Calling one without payment
+returns `HTTP 402` with a `PAYMENT-REQUIRED` challenge; x402-capable agents
+pay and retry automatically:
 
-- `GET /paid/scan_niche?query=...&region_code=US&recency_days=365&max_results=50`
-- `GET /paid/channel_outliers?channel=...&lookback_videos=30&min_multiple=2.5`
-- `GET /paid/video_context?video=...` — why a video over/under-performed vs its channel
-- `GET /paid/rising_channels?niche=...&max_subs=500000` — fastest-rising channels in a niche
+- `GET /paid/scan_niche?query=...` — 0.1 USDT/call
+- `GET /paid/channel_outliers?channel=...` — 0.1 USDT/call
+- `GET /paid/video_context?video=...` — 0.05 USDT/call, why a video over/under-performed
+- `GET /paid/rising_channels?niche=...&max_subs=500000` — 0.25 USDT/call, fastest-rising channels
 
 Responses are identical to the corresponding MCP tools. Payment schemes:
 `exact` (EIP-3009) and `aggr_deferred`, verified and settled through the OKX
