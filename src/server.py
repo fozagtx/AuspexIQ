@@ -561,8 +561,8 @@ def _payment_gate_error():
             "error": {
                 "code": "PAYMENT_NOT_CONFIGURED",
                 "message": "This paid endpoint is not accepting calls yet: the "
-                "operator has not configured payment credentials. Use the free "
-                "MCP endpoint at /mcp, or retry after the operator completes setup.",
+                "operator has not configured payment credentials. Retry after "
+                "the operator completes setup.",
                 "retryable": True,
             },
         },
