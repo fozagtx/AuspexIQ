@@ -58,7 +58,7 @@ MIN_MULTIPLE_MAX = 10.0
 
 # --- Paid endpoints (OKX Agent Payments Protocol, x402) ---
 PAYMENTS_ENABLED_ENV = "PAYMENTS_ENABLED"  # "false" serves the /paid routes free
-PAID_PRICE_USDT = "0.05"         # per-call price for the paid REST endpoints
+PAID_PRICE_USDT = "0.1"          # per-call price for the paid REST endpoints
 X402_NETWORK = "eip155:196"      # X Layer (USDT, 6 decimals)
 PAID_SCAN_PATH = "/paid/scan_niche"
 PAID_CHANNEL_PATH = "/paid/channel_outliers"
