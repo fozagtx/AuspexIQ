@@ -64,6 +64,26 @@ def outlier_multiple(views, baseline):
     return views / baseline
 
 
+def views_per_day(views, published_at, now):
+    age_days = max((now - published_at).total_seconds() / 86400, 1.0)
+    return views / age_days
+
+
+def classify_video(multiple):
+    """Deterministic performance label from the outlier multiple."""
+    if multiple is None:
+        return "INSUFFICIENT_BASELINE"
+    if multiple >= config.VIDEO_MEGA_OUTLIER_MULTIPLE:
+        return "MEGA_OUTLIER"
+    if multiple >= config.SCAN_OUTLIER_MULTIPLE:
+        return "OUTLIER"
+    if multiple >= config.VIDEO_ABOVE_BASELINE_MULTIPLE:
+        return "ABOVE_BASELINE"
+    if multiple >= config.VIDEO_TYPICAL_MULTIPLE:
+        return "TYPICAL"
+    return "UNDERPERFORMER"
+
+
 def assess_niche(videos, outlier_records, now):
     """Compute signals, saturation score, verdict, and reasons over the analyzed set.
 

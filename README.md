@@ -67,6 +67,8 @@ Protocol). Calling one without payment returns `HTTP 402` with a
 
 - `GET /paid/scan_niche?query=...&region_code=US&recency_days=365&max_results=50`
 - `GET /paid/channel_outliers?channel=...&lookback_videos=30&min_multiple=2.5`
+- `GET /paid/video_context?video=...` — why a video over/under-performed vs its channel
+- `GET /paid/rising_channels?niche=...&max_subs=500000` — fastest-rising channels in a niche
 
 Responses are identical to the corresponding MCP tools. Payment schemes:
 `exact` (EIP-3009) and `aggr_deferred`, verified and settled through the OKX

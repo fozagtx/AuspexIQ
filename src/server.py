@@ -14,7 +14,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -171,6 +171,24 @@ def _validate_scan(query, region_code, recency_days, max_results):
     return query.strip(), region, int(recency_days), int(max_results)
 
 
+async def _recent_uploads(channel, meter):
+    """Fetch and normalize the channel's most recent uploads."""
+    if not channel["uploads"]:
+        return []
+    page = await youtube.playlist_page(
+        channel["uploads"], config.BASELINE_RECENT_UPLOADS, None, meter
+    )
+    upload_ids = [
+        item["contentDetails"]["videoId"]
+        for item in page.get("items", [])
+        if item.get("contentDetails", {}).get("videoId")
+    ]
+    if not upload_ids:
+        return []
+    data = await youtube.list_videos(upload_ids, meter)
+    return [youtube.normalize_video(item) for item in data.get("items", [])]
+
+
 async def _deep_baseline(channel, now, meter):
     """Baseline from the channel's recent uploads; falls back to the lifetime
     average (real numbers from channels.list) when uploads can't qualify."""
@@ -178,21 +196,8 @@ async def _deep_baseline(channel, now, meter):
         analysis.lifetime_average(channel["view_count"], channel["video_count"]),
         "lifetime_avg",
     )
-    if not channel["uploads"]:
-        return fallback
     try:
-        page = await youtube.playlist_page(
-            channel["uploads"], config.BASELINE_RECENT_UPLOADS, None, meter
-        )
-        upload_ids = [
-            item["contentDetails"]["videoId"]
-            for item in page.get("items", [])
-            if item.get("contentDetails", {}).get("videoId")
-        ]
-        if not upload_ids:
-            return fallback
-        data = await youtube.list_videos(upload_ids, meter)
-        uploads = [youtube.normalize_video(item) for item in data.get("items", [])]
+        uploads = await _recent_uploads(channel, meter)
         baseline = analysis.recent_median_baseline(uploads, now)
         if baseline is None:
             return fallback
@@ -548,6 +553,357 @@ async def channel_outliers(
 
 
 # ---------------------------------------------------------------------------
+# Tool 3: video_context — why did this video blow up (or not)
+# ---------------------------------------------------------------------------
+
+
+def _parse_video_ref(reference):
+    """Extract an 11-char video ID from a raw ID or any YouTube video URL."""
+    ref = (reference or "").strip()
+    if not ref:
+        raise ToolFault(
+            "INVALID_INPUT", "'video' is required: a YouTube video URL or video ID.", False
+        )
+    if "/" not in ref and "?" not in ref and len(ref) == 11:
+        return ref
+    parsed = urlparse(ref if "://" in ref else "https://" + ref)
+    host = (parsed.hostname or "").lower()
+    segments = [s for s in parsed.path.split("/") if s]
+    candidate = None
+    if host.endswith("youtu.be") and segments:
+        candidate = segments[0]
+    elif "youtube.com" in host:
+        query = parse_qs(parsed.query)
+        if query.get("v"):
+            candidate = query["v"][0]
+        elif segments and segments[0] in ("shorts", "embed", "live") and len(segments) > 1:
+            candidate = segments[1]
+    if candidate and len(candidate) == 11:
+        return candidate
+    raise ToolFault(
+        "INVALID_INPUT",
+        f"Could not extract a video ID from '{reference}'. Pass a YouTube video "
+        f"URL or the 11-character video ID.",
+        False,
+    )
+
+
+async def _video_context_pipeline(video_id, meter):
+    now = _now()
+    data = await youtube.list_videos([video_id], meter)
+    items = data.get("items") or []
+    if not items:
+        raise ToolFault(
+            "VIDEO_NOT_FOUND",
+            f"No YouTube video exists for id '{video_id}'. Check the URL/ID.",
+            False,
+        )
+    video = youtube.normalize_video(items[0])
+    if video["views"] is None or video["published_at"] is None:
+        raise ToolFault(
+            "VIDEO_NOT_FOUND",
+            "This video's view count is hidden or metadata is unavailable, so it "
+            "cannot be analyzed.",
+            False,
+        )
+
+    channel_data = await youtube.list_channels([video["channel_id"]], meter)
+    channel_items = channel_data.get("items") or []
+    if not channel_items:
+        raise ToolFault(
+            "CHANNEL_NOT_FOUND", "The video's channel could not be fetched.", False
+        )
+    channel = youtube.normalize_channel(channel_items[0])
+
+    percentile = None
+    velocity_multiple = None
+    channel_median_vpd = None
+    try:
+        uploads = await _recent_uploads(channel, meter)
+    except ToolFault as fault:
+        if fault.code in ("QUOTA_EXHAUSTED", "MISSING_API_KEY"):
+            raise
+        uploads = []
+    baseline = analysis.recent_median_baseline(uploads, now)
+    if baseline is None:
+        baseline = analysis.lifetime_average(channel["view_count"], channel["video_count"])
+        method = "lifetime_avg"
+    else:
+        method = "recent_median"
+
+    peers = [
+        u
+        for u in uploads
+        if u["views"] is not None and u["published_at"] is not None and u["id"] != video_id
+    ]
+    if peers:
+        percentile = round(
+            100 * sum(1 for u in peers if u["views"] < video["views"]) / len(peers)
+        )
+        peer_vpd = sorted(
+            analysis.views_per_day(u["views"], u["published_at"], now) for u in peers
+        )
+        channel_median_vpd = peer_vpd[len(peer_vpd) // 2]
+        if channel_median_vpd > 0:
+            velocity_multiple = (
+                analysis.views_per_day(video["views"], video["published_at"], now)
+                / channel_median_vpd
+            )
+
+    multiple = analysis.outlier_multiple(video["views"], baseline)
+    classification = analysis.classify_video(multiple)
+    age_days = max((now - video["published_at"]).total_seconds() / 86400, 1.0)
+
+    why = []
+    if multiple is not None:
+        why.append(
+            f"{multiple:.1f}x the channel's "
+            f"{'recent median' if method == 'recent_median' else 'lifetime average'} "
+            f"of {round(baseline):,} views"
+        )
+    else:
+        why.append(
+            f"channel baseline is below {config.BASELINE_FLOOR} views, too small "
+            f"to compute a meaningful multiple"
+        )
+    if percentile is not None:
+        why.append(f"beats {percentile}% of the channel's recent uploads")
+    if velocity_multiple is not None:
+        why.append(
+            f"earning views {velocity_multiple:.1f}x faster per day than the "
+            f"channel's recent median pace"
+        )
+
+    return {
+        "ok": True,
+        "video": {
+            "title": video["title"],
+            "url": _watch_url(video_id),
+            "views": video["views"],
+            "published_at": _iso(video["published_at"]),
+            "age_days": round(age_days, 1),
+        },
+        "channel": {
+            "id": channel["id"],
+            "title": channel["title"],
+            "subscribers": channel["subs"] if channel["subs"] is not None else 0,
+            "baseline": round(baseline),
+            "baseline_method": method,
+        },
+        "outlier_multiple": round(multiple, 2) if multiple is not None else None,
+        "percentile_vs_recent_uploads": percentile,
+        "views_per_day": round(analysis.views_per_day(video["views"], video["published_at"], now)),
+        "channel_median_views_per_day": round(channel_median_vpd) if channel_median_vpd else None,
+        "velocity_multiple": round(velocity_multiple, 2) if velocity_multiple else None,
+        "classification": classification,
+        "why": why,
+    }
+
+
+async def _video_context_request(video):
+    params_hash = _params_hash((video,))
+    started = time.monotonic()
+    try:
+        video_id = _parse_video_ref(video)
+    except ToolFault as fault:
+        _log_request("video_context", params_hash, "-", 0, started, fault.code)
+        return fault.to_response()
+    cache_key = ("video_context", video_id)
+    return await _execute(
+        "video_context",
+        params_hash,
+        cache_key,
+        config.CHANNEL_CACHE_TTL_S,
+        config.VIDEO_CONTEXT_WORST_CASE_UNITS,
+        lambda meter: _video_context_pipeline(video_id, meter),
+    )
+
+
+@mcp.tool
+async def video_context(video: str) -> dict:
+    """Explain any YouTube video's performance relative to its own channel,
+    using live YouTube data: outlier multiple vs the channel's recent-median
+    baseline, percentile among recent uploads, views-per-day velocity, and a
+    classification from MEGA_OUTLIER to UNDERPERFORMER.
+
+    video: a YouTube video URL or the 11-character video ID.
+    """
+    return await _video_context_request(video)
+
+
+# ---------------------------------------------------------------------------
+# Tool 4: rising_channels — momentum radar for a niche
+# ---------------------------------------------------------------------------
+
+
+def _validate_radar(niche, region_code, recency_days, max_subs):
+    query, region, days, _ = _validate_scan(
+        niche, region_code, recency_days, config.RADAR_SEARCH_RESULTS
+    )
+    if not (config.RADAR_MAX_SUBS_MIN <= max_subs <= config.RADAR_MAX_SUBS_MAX):
+        raise ToolFault(
+            "INVALID_INPUT",
+            f"'max_subs' must be between {config.RADAR_MAX_SUBS_MIN} and "
+            f"{config.RADAR_MAX_SUBS_MAX}.",
+            False,
+        )
+    return query, region, days, int(max_subs)
+
+
+async def _radar_pipeline(niche, region, recency_days, max_subs, meter):
+    now = _now()
+    published_after = _iso(now - timedelta(days=recency_days))
+
+    search = await youtube.search_videos(
+        niche, region, published_after, config.RADAR_SEARCH_RESULTS, meter
+    )
+    video_ids = _dedupe(
+        item["id"]["videoId"]
+        for item in search.get("items", [])
+        if item.get("id", {}).get("videoId")
+    )
+    videos = []
+    if video_ids:
+        data = await youtube.list_videos(video_ids, meter)
+        for item in data.get("items", []):
+            video = youtube.normalize_video(item)
+            if video["views"] is None or video["published_at"] is None:
+                continue
+            if analysis.is_short(video["seconds"]) or not video["channel_id"]:
+                continue
+            videos.append(video)
+
+    channels_by_id = {}
+    channel_ids = _dedupe(v["channel_id"] for v in videos)
+    if channel_ids:
+        data = await youtube.list_channels(channel_ids, meter)
+        channels_by_id = {
+            channel["id"]: channel
+            for channel in (youtube.normalize_channel(item) for item in data.get("items", []))
+        }
+    videos = [v for v in videos if v["channel_id"] in channels_by_id]
+
+    # candidates: small enough, with a lifetime average above the floor
+    candidates = []
+    for cid, channel in channels_by_id.items():
+        if channel["subs"] is None or channel["subs"] > max_subs:
+            continue
+        if (
+            analysis.lifetime_average(channel["view_count"], channel["video_count"])
+            < config.BASELINE_FLOOR
+        ):
+            continue
+        candidates.append(cid)
+
+    result_counts = Counter(v["channel_id"] for v in videos)
+    views_in_set = defaultdict(int)
+    for v in videos:
+        views_in_set[v["channel_id"]] += v["views"]
+    candidates.sort(key=lambda cid: (-result_counts[cid], -views_in_set[cid], cid))
+    deep_ids = candidates[: config.RADAR_DEEP_CHANNELS]
+
+    momentum_by_id = {}
+    semaphore = asyncio.Semaphore(config.BASELINE_CONCURRENCY)
+
+    async def measure(channel_id):
+        channel = channels_by_id[channel_id]
+        async with semaphore:
+            try:
+                uploads = await _recent_uploads(channel, meter)
+            except ToolFault as fault:
+                if fault.code in ("QUOTA_EXHAUSTED", "MISSING_API_KEY"):
+                    raise
+                return
+        recent = analysis.recent_median_baseline(uploads, now)
+        if recent is None:
+            return  # not enough qualifying uploads to measure momentum honestly
+        lifetime = analysis.lifetime_average(channel["view_count"], channel["video_count"])
+        momentum_by_id[channel_id] = (recent, lifetime, recent / lifetime)
+
+    await asyncio.gather(*(measure(cid) for cid in deep_ids))
+
+    rising = []
+    for cid, (recent, lifetime, momentum) in momentum_by_id.items():
+        channel = channels_by_id[cid]
+        top_video = max(
+            (v for v in videos if v["channel_id"] == cid), key=lambda v: v["views"]
+        )
+        sample_multiple = analysis.outlier_multiple(top_video["views"], recent)
+        rising.append(
+            {
+                "channel": channel["title"],
+                "channel_id": cid,
+                "url": "https://www.youtube.com/channel/" + cid,
+                "subscribers": channel["subs"],
+                "videos_in_results": result_counts[cid],
+                "recent_median_views": round(recent),
+                "lifetime_avg_views": round(lifetime),
+                "momentum_multiple": round(momentum, 2),
+                "sample_breakout": {
+                    "title": top_video["title"],
+                    "url": _watch_url(top_video["id"]),
+                    "views": top_video["views"],
+                    "outlier_multiple": round(sample_multiple, 2)
+                    if sample_multiple is not None
+                    else None,
+                },
+            }
+        )
+    rising.sort(key=lambda r: -r["momentum_multiple"])
+
+    return {
+        "ok": True,
+        "niche": niche,
+        "region_code": region,
+        "analyzed": {
+            "videos": len(videos),
+            "channels": len(channels_by_id),
+            "candidates_measured": len(momentum_by_id),
+        },
+        "rising": rising[: config.RADAR_MAX_CHANNELS],
+    }
+
+
+async def _radar_request(niche, region_code, recency_days, max_subs):
+    params_hash = _params_hash((niche, region_code, recency_days, max_subs))
+    started = time.monotonic()
+    try:
+        q, region, days, subs_cap = _validate_radar(
+            niche, region_code, recency_days, max_subs
+        )
+    except ToolFault as fault:
+        _log_request("rising_channels", params_hash, "-", 0, started, fault.code)
+        return fault.to_response()
+    cache_key = ("rising_channels", q.lower(), region, days, subs_cap)
+    return await _execute(
+        "rising_channels",
+        params_hash,
+        cache_key,
+        config.SCAN_CACHE_TTL_S,
+        config.RADAR_WORST_CASE_UNITS,
+        lambda meter: _radar_pipeline(q, region, days, subs_cap, meter),
+    )
+
+
+@mcp.tool
+async def rising_channels(
+    niche: str,
+    region_code: str = config.DEFAULT_REGION_CODE,
+    recency_days: int = config.RECENCY_DAYS_DEFAULT,
+    max_subs: int = config.RADAR_MAX_SUBS_DEFAULT,
+) -> dict:
+    """Find the fastest-rising channels in a YouTube niche using live data:
+    channels whose recent-median views far exceed their lifetime average.
+    Built for sponsor scouting, collab targeting, and competitor detection.
+
+    niche: the niche keyword (2-80 chars). region_code: ISO 3166-1 alpha-2.
+    recency_days: search window (30-1825). max_subs: only return channels at
+    or below this subscriber count (1000-10000000, default 500000).
+    """
+    return await _radar_request(niche, region_code, recency_days, max_subs)
+
+
+# ---------------------------------------------------------------------------
 # Paid REST endpoints (x402-gated; same pipelines, same no-mock rules)
 # ---------------------------------------------------------------------------
 
@@ -630,6 +986,33 @@ async def paid_channel_outliers(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+@mcp.custom_route(config.PAID_VIDEO_PATH, methods=["GET"])
+async def paid_video_context(request: Request) -> JSONResponse:
+    if _payment_mode == "unconfigured":
+        return _payment_gate_error()
+    result = await _video_context_request(request.query_params.get("video", ""))
+    return JSONResponse(result)
+
+
+@mcp.custom_route(config.PAID_RADAR_PATH, methods=["GET"])
+async def paid_rising_channels(request: Request) -> JSONResponse:
+    if _payment_mode == "unconfigured":
+        return _payment_gate_error()
+    params = request.query_params
+    try:
+        recency_days = _int_param(params, "recency_days", config.RECENCY_DAYS_DEFAULT)
+        max_subs = _int_param(params, "max_subs", config.RADAR_MAX_SUBS_DEFAULT)
+    except ToolFault as fault:
+        return JSONResponse(fault.to_response())
+    result = await _radar_request(
+        params.get("niche", ""),
+        params.get("region_code", config.DEFAULT_REGION_CODE),
+        recency_days,
+        max_subs,
+    )
+    return JSONResponse(result)
+
+
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
@@ -710,6 +1093,16 @@ def _build_app():
         f"GET {config.PAID_CHANNEL_PATH}": RouteConfig(
             accepts=options(),
             description="Live YouTube channel outlier audit vs the channel's own baseline",
+            mime_type="application/json",
+        ),
+        f"GET {config.PAID_VIDEO_PATH}": RouteConfig(
+            accepts=options(),
+            description="Explain any YouTube video's performance vs its own channel's baseline",
+            mime_type="application/json",
+        ),
+        f"GET {config.PAID_RADAR_PATH}": RouteConfig(
+            accepts=options(),
+            description="Fastest-rising channels in a YouTube niche by recent-vs-lifetime momentum",
             mime_type="application/json",
         ),
     }
