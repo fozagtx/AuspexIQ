@@ -551,7 +551,9 @@ async def channel_outliers(
 # Paid REST endpoints (x402-gated; same pipelines, same no-mock rules)
 # ---------------------------------------------------------------------------
 
-_payments_enabled = False  # set only when the x402 middleware is installed
+# "enforced" (x402 middleware installed) | "free" (explicitly disabled, serve
+# results directly) | "unconfigured" (payments expected but credentials absent)
+_payment_mode = "unconfigured"
 
 
 def _payment_gate_error():
@@ -592,7 +594,7 @@ def _float_param(params, name, default):
 
 @mcp.custom_route(config.PAID_SCAN_PATH, methods=["GET"])
 async def paid_scan_niche(request: Request) -> JSONResponse:
-    if not _payments_enabled:
+    if _payment_mode == "unconfigured":
         return _payment_gate_error()
     params = request.query_params
     try:
@@ -611,7 +613,7 @@ async def paid_scan_niche(request: Request) -> JSONResponse:
 
 @mcp.custom_route(config.PAID_CHANNEL_PATH, methods=["GET"])
 async def paid_channel_outliers(request: Request) -> JSONResponse:
-    if not _payments_enabled:
+    if _payment_mode == "unconfigured":
         return _payment_gate_error()
     params = request.query_params
     try:
@@ -636,8 +638,20 @@ async def healthz(request: Request) -> JSONResponse:
 def _build_app():
     """Build the ASGI app; install the x402 payment middleware when the
     payment credentials are fully configured."""
-    global _payments_enabled
+    global _payment_mode
     application = mcp.http_app()
+
+    if os.environ.get(config.PAYMENTS_ENABLED_ENV, "true").strip().lower() in (
+        "false",
+        "0",
+        "no",
+    ):
+        _payment_mode = "free"
+        log.info(
+            "payments disabled via %s — the /paid endpoints serve results directly",
+            config.PAYMENTS_ENABLED_ENV,
+        )
+        return application
 
     creds = {
         name: os.environ.get(name, "").strip()
@@ -700,7 +714,7 @@ def _build_app():
         ),
     }
     application.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
-    _payments_enabled = True
+    _payment_mode = "enforced"
     log.info(
         "x402 payments enabled: %s per call on %s, pay-to %s",
         price,
