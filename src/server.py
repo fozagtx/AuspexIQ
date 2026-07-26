@@ -19,6 +19,17 @@ from urllib.parse import urlencode, urlparse
 from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from x402.http import (
+    OKXAuthConfig,
+    OKXFacilitatorClient,
+    OKXFacilitatorConfig,
+    PaymentOption,
+)
+from x402.http.middleware.fastapi import PaymentMiddlewareASGI
+from x402.http.types import RouteConfig
+from x402.mechanisms.evm.deferred.server import AggrDeferredEvmScheme
+from x402.mechanisms.evm.exact.server import ExactEvmScheme
+from x402.server import x402ResourceServer
 
 import config
 from src import analysis, youtube
@@ -306,21 +317,9 @@ async def _scan_pipeline(query, region, recency_days, max_results, meter):
     }
 
 
-@mcp.tool
-async def scan_niche(
-    query: str,
-    region_code: str = config.DEFAULT_REGION_CODE,
-    recency_days: int = config.RECENCY_DAYS_DEFAULT,
-    max_results: int = config.MAX_RESULTS_DEFAULT,
-) -> dict:
-    """Assess a YouTube niche keyword using live YouTube data: who ranks, how
-    concentrated the niche is, which videos are outliers relative to their own
-    channel's baseline, and an ENTER / CROWDED / AVOID verdict for a new entrant.
-
-    query: the niche keyword (2-80 chars). region_code: ISO 3166-1 alpha-2
-    (default US). recency_days: only consider videos published in this window
-    (30-1825, default 365). max_results: search results to analyze (10-50).
-    """
+async def _scan_request(query, region_code, recency_days, max_results):
+    """Full scan_niche request: validation, cache, quota, pipeline. Shared by
+    the MCP tool and the paid REST endpoint."""
     params_hash = _params_hash((query, region_code, recency_days, max_results))
     started = time.monotonic()
     try:
@@ -339,6 +338,24 @@ async def scan_niche(
         config.SCAN_WORST_CASE_UNITS,
         lambda meter: _scan_pipeline(q, region, days, n_results, meter),
     )
+
+
+@mcp.tool
+async def scan_niche(
+    query: str,
+    region_code: str = config.DEFAULT_REGION_CODE,
+    recency_days: int = config.RECENCY_DAYS_DEFAULT,
+    max_results: int = config.MAX_RESULTS_DEFAULT,
+) -> dict:
+    """Assess a YouTube niche keyword using live YouTube data: who ranks, how
+    concentrated the niche is, which videos are outliers relative to their own
+    channel's baseline, and an ENTER / CROWDED / AVOID verdict for a new entrant.
+
+    query: the niche keyword (2-80 chars). region_code: ISO 3166-1 alpha-2
+    (default US). recency_days: only consider videos published in this window
+    (30-1825, default 365). max_results: search results to analyze (10-50).
+    """
+    return await _scan_request(query, region_code, recency_days, max_results)
 
 
 # ---------------------------------------------------------------------------
@@ -488,21 +505,9 @@ async def _channel_pipeline(channel_ref, lookback, min_multiple, meter):
     }
 
 
-@mcp.tool
-async def channel_outliers(
-    channel: str,
-    lookback_videos: int = config.LOOKBACK_VIDEOS_DEFAULT,
-    min_multiple: float = config.MIN_MULTIPLE_DEFAULT,
-) -> dict:
-    """Reveal which of a YouTube channel's recent videos overperformed the
-    channel's own baseline (median views of recent long-form uploads), using
-    live YouTube data.
-
-    channel: a channel ID (UC...), an @handle, or a full youtube.com channel
-    URL. lookback_videos: how many recent uploads to analyze (10-100, default
-    30). min_multiple: views/baseline threshold to count as an outlier
-    (1.5-10, default 2.5).
-    """
+async def _channel_request(channel, lookback_videos, min_multiple):
+    """Full channel_outliers request: validation, cache, quota, pipeline.
+    Shared by the MCP tool and the paid REST endpoint."""
     params_hash = _params_hash((channel, lookback_videos, min_multiple))
     started = time.monotonic()
     try:
@@ -524,6 +529,100 @@ async def channel_outliers(
     )
 
 
+@mcp.tool
+async def channel_outliers(
+    channel: str,
+    lookback_videos: int = config.LOOKBACK_VIDEOS_DEFAULT,
+    min_multiple: float = config.MIN_MULTIPLE_DEFAULT,
+) -> dict:
+    """Reveal which of a YouTube channel's recent videos overperformed the
+    channel's own baseline (median views of recent long-form uploads), using
+    live YouTube data.
+
+    channel: a channel ID (UC...), an @handle, or a full youtube.com channel
+    URL. lookback_videos: how many recent uploads to analyze (10-100, default
+    30). min_multiple: views/baseline threshold to count as an outlier
+    (1.5-10, default 2.5).
+    """
+    return await _channel_request(channel, lookback_videos, min_multiple)
+
+
+# ---------------------------------------------------------------------------
+# Paid REST endpoints (x402-gated; same pipelines, same no-mock rules)
+# ---------------------------------------------------------------------------
+
+_payments_enabled = False  # set only when the x402 middleware is installed
+
+
+def _payment_gate_error():
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": {
+                "code": "PAYMENT_NOT_CONFIGURED",
+                "message": "This paid endpoint is not accepting calls yet: the "
+                "operator has not configured payment credentials. Use the free "
+                "MCP endpoint at /mcp, or retry after the operator completes setup.",
+                "retryable": True,
+            },
+        },
+        status_code=503,
+    )
+
+
+def _int_param(params, name, default):
+    raw = params.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ToolFault("INVALID_INPUT", f"'{name}' must be an integer.", False)
+
+
+def _float_param(params, name, default):
+    raw = params.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ToolFault("INVALID_INPUT", f"'{name}' must be a number.", False)
+
+
+@mcp.custom_route(config.PAID_SCAN_PATH, methods=["GET"])
+async def paid_scan_niche(request: Request) -> JSONResponse:
+    if not _payments_enabled:
+        return _payment_gate_error()
+    params = request.query_params
+    try:
+        recency_days = _int_param(params, "recency_days", config.RECENCY_DAYS_DEFAULT)
+        max_results = _int_param(params, "max_results", config.MAX_RESULTS_DEFAULT)
+    except ToolFault as fault:
+        return JSONResponse(fault.to_response())
+    result = await _scan_request(
+        params.get("query", ""),
+        params.get("region_code", config.DEFAULT_REGION_CODE),
+        recency_days,
+        max_results,
+    )
+    return JSONResponse(result)
+
+
+@mcp.custom_route(config.PAID_CHANNEL_PATH, methods=["GET"])
+async def paid_channel_outliers(request: Request) -> JSONResponse:
+    if not _payments_enabled:
+        return _payment_gate_error()
+    params = request.query_params
+    try:
+        lookback = _int_param(params, "lookback_videos", config.LOOKBACK_VIDEOS_DEFAULT)
+        multiple = _float_param(params, "min_multiple", config.MIN_MULTIPLE_DEFAULT)
+    except ToolFault as fault:
+        return JSONResponse(fault.to_response())
+    result = await _channel_request(params.get("channel", ""), lookback, multiple)
+    return JSONResponse(result)
+
+
 # ---------------------------------------------------------------------------
 # Health check + ASGI app + entrypoint
 # ---------------------------------------------------------------------------
@@ -534,7 +633,84 @@ async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-app = mcp.http_app()
+def _build_app():
+    """Build the ASGI app; install the x402 payment middleware when the
+    payment credentials are fully configured."""
+    global _payments_enabled
+    application = mcp.http_app()
+
+    creds = {
+        name: os.environ.get(name, "").strip()
+        for name in (
+            config.OKX_API_KEY_ENV,
+            config.OKX_SECRET_KEY_ENV,
+            config.OKX_PASSPHRASE_ENV,
+            config.PAY_TO_ADDRESS_ENV,
+        )
+    }
+    missing = [name for name, value in creds.items() if not value]
+    if missing:
+        log.critical(
+            "x402 payment credentials missing (%s) — paid endpoints return "
+            "PAYMENT_NOT_CONFIGURED until they are set",
+            ", ".join(missing),
+        )
+        return application
+
+    facilitator = OKXFacilitatorClient(
+        OKXFacilitatorConfig(
+            auth=OKXAuthConfig(
+                api_key=creds[config.OKX_API_KEY_ENV],
+                secret_key=creds[config.OKX_SECRET_KEY_ENV],
+                passphrase=creds[config.OKX_PASSPHRASE_ENV],
+            ),
+            base_url=os.environ.get(config.OKX_BASE_URL_ENV, "").strip(),
+        )
+    )
+    x402_server = x402ResourceServer(facilitator)
+    x402_server.register(config.X402_NETWORK, ExactEvmScheme())
+    x402_server.register(config.X402_NETWORK, AggrDeferredEvmScheme())
+
+    pay_to = creds[config.PAY_TO_ADDRESS_ENV]
+    price = f"${config.PAID_PRICE_USDT}"
+
+    def options():
+        return [
+            PaymentOption(
+                scheme="exact", price=price, network=config.X402_NETWORK, pay_to=pay_to
+            ),
+            PaymentOption(
+                scheme="aggr_deferred",
+                price=price,
+                network=config.X402_NETWORK,
+                pay_to=pay_to,
+            ),
+        ]
+
+    routes = {
+        f"GET {config.PAID_SCAN_PATH}": RouteConfig(
+            accepts=options(),
+            description="Live YouTube niche scan: saturation, outliers, ENTER/CROWDED/AVOID verdict",
+            mime_type="application/json",
+        ),
+        f"GET {config.PAID_CHANNEL_PATH}": RouteConfig(
+            accepts=options(),
+            description="Live YouTube channel outlier audit vs the channel's own baseline",
+            mime_type="application/json",
+        ),
+    }
+    application.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
+    _payments_enabled = True
+    log.info(
+        "x402 payments enabled: %s per call on %s, pay-to %s",
+        price,
+        config.X402_NETWORK,
+        pay_to,
+    )
+    return application
+
+
+app = _build_app()
 
 if __name__ == "__main__":
     if "--stdio" in sys.argv:

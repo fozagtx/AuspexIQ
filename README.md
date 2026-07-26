@@ -55,6 +55,23 @@ them in your host's dashboard — the server reads the process environment):
 | `YT_API_KEY` | yes | — | YouTube Data API v3 key. If unset, the server starts (health checks pass) but every tool call returns the `MISSING_API_KEY` structured error. |
 | `PORT` | no | `8000` | HTTP listen port. |
 | `DAILY_UNIT_BUDGET` | no | `9000` | Hard daily cap on YouTube quota units the server will spend (Google's free tier is 10,000/day; the quota day resets at midnight Pacific). When spent, calls return `QUOTA_EXHAUSTED` with the reset time. |
+| `OKX_API_KEY` / `OKX_SECRET_KEY` / `OKX_PASSPHRASE` | for paid endpoints | — | OKX Developer Portal API credentials for the x402 payment facilitator. When any is missing, the paid REST endpoints return `PAYMENT_NOT_CONFIGURED` (503) and everything else works normally. |
+| `PAY_TO_ADDRESS` | for paid endpoints | — | EVM wallet address that receives the per-call payments (USDT on X Layer). |
+
+## Paid endpoints (x402)
+
+Alongside the free MCP surface, the server exposes two x402-gated REST
+endpoints priced at **0.1 USDT per call** (X Layer, OKX Agent Payments
+Protocol). Calling one without payment returns `HTTP 402` with a
+`PAYMENT-REQUIRED` challenge; x402-capable agents pay and retry automatically:
+
+- `GET /paid/scan_niche?query=...&region_code=US&recency_days=365&max_results=50`
+- `GET /paid/channel_outliers?channel=...&lookback_videos=30&min_multiple=2.5`
+
+Responses are identical to the corresponding MCP tools. Payment schemes:
+`exact` (EIP-3009) and `aggr_deferred`, verified and settled through the OKX
+facilitator. Price and network are `config.py` constants (`PAID_PRICE_USDT`,
+`X402_NETWORK`).
 
 ## Local run
 

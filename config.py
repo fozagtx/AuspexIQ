@@ -56,6 +56,17 @@ MIN_MULTIPLE_DEFAULT = 2.5
 MIN_MULTIPLE_MIN = 1.5
 MIN_MULTIPLE_MAX = 10.0
 
+# --- Paid endpoints (OKX Agent Payments Protocol, x402) ---
+PAID_PRICE_USDT = "0.1"          # per-call price for the paid REST endpoints
+X402_NETWORK = "eip155:196"      # X Layer (USDT, 6 decimals)
+PAID_SCAN_PATH = "/paid/scan_niche"
+PAID_CHANNEL_PATH = "/paid/channel_outliers"
+OKX_API_KEY_ENV = "OKX_API_KEY"
+OKX_SECRET_KEY_ENV = "OKX_SECRET_KEY"
+OKX_PASSPHRASE_ENV = "OKX_PASSPHRASE"
+PAY_TO_ADDRESS_ENV = "PAY_TO_ADDRESS"
+OKX_BASE_URL_ENV = "OKX_BASE_URL"
+
 # --- Cache ---
 SCAN_CACHE_TTL_S = 6 * 3600
 CHANNEL_CACHE_TTL_S = 3 * 3600
