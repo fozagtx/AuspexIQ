@@ -208,6 +208,14 @@ async def _deep_baseline(channel, now, meter):
         return fallback
 
 
+def _video_format(record):
+    if record.get("stream"):
+        return "livestream"
+    if analysis.is_short(record.get("seconds", 0)):
+        return "short"
+    return "video"
+
+
 def _format_outlier(record):
     method_label = (
         "recent median" if record["baseline_method"] == "recent_median" else "lifetime average"
@@ -216,9 +224,11 @@ def _format_outlier(record):
         "title": record["title"],
         "url": _watch_url(record["id"]),
         "channel": record["channel_title"],
+        "channel_id": record["channel_id"],
         "channel_subs": record["subs"] if record["subs"] is not None else 0,
         "views": record["views"],
         "published_at": _iso(record["published_at"]),
+        "format": _video_format(record),
         "channel_baseline": round(record["baseline"]),
         "baseline_method": record["baseline_method"],
         "outlier_multiple": round(record["multiple"], 2),
@@ -238,6 +248,7 @@ async def _scan_pipeline(query, region, recency_days, max_results, meter):
     )
 
     videos = []
+    streams_filtered = 0
     if video_ids:
         data = await youtube.list_videos(video_ids, meter)
         for item in data.get("items", []):
@@ -245,6 +256,9 @@ async def _scan_pipeline(query, region, recency_days, max_results, meter):
             if video["views"] is None or video["published_at"] is None:
                 continue  # hidden view count or missing metadata
             if analysis.is_short(video["seconds"]):
+                continue
+            if video["stream"]:
+                streams_filtered += 1  # cumulative stream views skew comparisons
                 continue
             if not video["channel_id"]:
                 continue
@@ -311,6 +325,7 @@ async def _scan_pipeline(query, region, recency_days, max_results, meter):
             "videos": len(videos),
             "channels": len(result_counts),
             "deep_baseline_channels": len(deep_ids),
+            "livestreams_filtered": streams_filtered,
         },
         "saturation_score": saturation,
         "verdict": verdict,
@@ -411,6 +426,17 @@ async def _resolve_channel(reference, meter):
     elif ref.startswith(("http://", "https://")) or "youtube.com" in ref or "youtu.be" in ref:
         parsed = urlparse(ref if "://" in ref else "https://" + ref)
         segments = [s for s in parsed.path.split("/") if s]
+        host = (parsed.hostname or "").lower()
+        if host.endswith("youtu.be") or (
+            segments and segments[0] in ("watch", "shorts", "embed", "live")
+        ):
+            raise ToolFault(
+                "INVALID_INPUT",
+                "That looks like a video URL, not a channel. Pass a channel ID "
+                "(UC...), an @handle, or a channel URL — or use video_context to "
+                "analyze a single video.",
+                False,
+            )
         if segments and segments[0] == "channel" and len(segments) > 1:
             channel_id = segments[1]
         elif segments:
@@ -654,6 +680,7 @@ async def _video_context_pipeline(video_id, meter):
     classification = analysis.classify_video(multiple)
     age_days = max((now - video["published_at"]).total_seconds() / 86400, 1.0)
 
+    video_format = _video_format(video)
     why = []
     if multiple is not None:
         why.append(
@@ -666,12 +693,17 @@ async def _video_context_pipeline(video_id, meter):
             f"channel baseline is below {config.BASELINE_FLOOR} views, too small "
             f"to compute a meaningful multiple"
         )
+    if video_format != "video":
+        why.append(
+            f"note: this is a {video_format}, compared against the channel's "
+            f"long-form baseline (streams and Shorts accumulate views differently)"
+        )
     if percentile is not None:
         why.append(f"beats {percentile}% of the channel's recent uploads")
     if velocity_multiple is not None:
         why.append(
-            f"earning views {velocity_multiple:.1f}x faster per day than the "
-            f"channel's recent median pace"
+            f"has averaged {velocity_multiple:.1f}x more views per day over its "
+            f"life than the channel's recent uploads"
         )
 
     return {
@@ -682,6 +714,7 @@ async def _video_context_pipeline(video_id, meter):
             "views": video["views"],
             "published_at": _iso(video["published_at"]),
             "age_days": round(age_days, 1),
+            "format": video_format,
         },
         "channel": {
             "id": channel["id"],
@@ -823,7 +856,11 @@ async def _radar_pipeline(niche, region, recency_days, max_subs, meter):
     await asyncio.gather(*(measure(cid) for cid in deep_ids))
 
     rising = []
+    cooling_count = 0
     for cid, (recent, lifetime, momentum) in momentum_by_id.items():
+        if momentum < config.RADAR_MIN_MOMENTUM:
+            cooling_count += 1  # declining channels are never sold as "rising"
+            continue
         channel = channels_by_id[cid]
         top_video = max(
             (v for v in videos if v["channel_id"] == cid), key=lambda v: v["views"]
@@ -839,7 +876,7 @@ async def _radar_pipeline(niche, region, recency_days, max_subs, meter):
                 "recent_median_views": round(recent),
                 "lifetime_avg_views": round(lifetime),
                 "momentum_multiple": round(momentum, 2),
-                "sample_breakout": {
+                "top_video_in_results": {
                     "title": top_video["title"],
                     "url": _watch_url(top_video["id"]),
                     "views": top_video["views"],
@@ -851,6 +888,23 @@ async def _radar_pipeline(niche, region, recency_days, max_subs, meter):
         )
     rising.sort(key=lambda r: -r["momentum_multiple"])
 
+    measured = len(momentum_by_id)
+    if measured == 0:
+        note = (
+            "no channels in this niche could be measured for momentum (too few "
+            "qualifying recent uploads); try a broader niche or a higher max_subs"
+        )
+    elif not rising:
+        note = (
+            f"none of the {measured} measured channels are genuinely rising — every "
+            f"recent median sits below its lifetime average; this niche is cooling"
+        )
+    else:
+        note = (
+            f"{len(rising)} of {measured} measured channels have recent-median views "
+            f"above their lifetime average ({cooling_count} cooling channels excluded)"
+        )
+
     return {
         "ok": True,
         "niche": niche,
@@ -858,8 +912,10 @@ async def _radar_pipeline(niche, region, recency_days, max_subs, meter):
         "analyzed": {
             "videos": len(videos),
             "channels": len(channels_by_id),
-            "candidates_measured": len(momentum_by_id),
+            "candidates_measured": measured,
+            "cooling_excluded": cooling_count,
         },
+        "note": note,
         "rising": rising[: config.RADAR_MAX_CHANNELS],
     }
 
@@ -928,6 +984,25 @@ def _payment_gate_error():
     )
 
 
+_REST_STATUS = {
+    "INVALID_INPUT": 400,
+    "CHANNEL_NOT_FOUND": 404,
+    "VIDEO_NOT_FOUND": 404,
+    "QUOTA_EXHAUSTED": 429,
+    "YT_API_ERROR": 502,
+    "MISSING_API_KEY": 503,
+    "UPSTREAM_TIMEOUT": 504,
+}
+
+
+def _rest_response(result):
+    """REST callers get real HTTP status codes; the body stays structured."""
+    if result.get("ok"):
+        return JSONResponse(result)
+    code = result.get("error", {}).get("code", "")
+    return JSONResponse(result, status_code=_REST_STATUS.get(code, 500))
+
+
 def _int_param(params, name, default):
     raw = params.get(name)
     if raw is None or raw == "":
@@ -957,14 +1032,14 @@ async def paid_scan_niche(request: Request) -> JSONResponse:
         recency_days = _int_param(params, "recency_days", config.RECENCY_DAYS_DEFAULT)
         max_results = _int_param(params, "max_results", config.MAX_RESULTS_DEFAULT)
     except ToolFault as fault:
-        return JSONResponse(fault.to_response())
+        return _rest_response(fault.to_response())
     result = await _scan_request(
         params.get("query", ""),
         params.get("region_code", config.DEFAULT_REGION_CODE),
         recency_days,
         max_results,
     )
-    return JSONResponse(result)
+    return _rest_response(result)
 
 
 @mcp.custom_route(config.PAID_CHANNEL_PATH, methods=["GET"])
@@ -976,9 +1051,9 @@ async def paid_channel_outliers(request: Request) -> JSONResponse:
         lookback = _int_param(params, "lookback_videos", config.LOOKBACK_VIDEOS_DEFAULT)
         multiple = _float_param(params, "min_multiple", config.MIN_MULTIPLE_DEFAULT)
     except ToolFault as fault:
-        return JSONResponse(fault.to_response())
+        return _rest_response(fault.to_response())
     result = await _channel_request(params.get("channel", ""), lookback, multiple)
-    return JSONResponse(result)
+    return _rest_response(result)
 
 
 # ---------------------------------------------------------------------------
@@ -986,12 +1061,13 @@ async def paid_channel_outliers(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+@mcp.custom_route("/api/video_context", methods=["GET"])  # neutral alias while free
 @mcp.custom_route(config.PAID_VIDEO_PATH, methods=["GET"])
 async def paid_video_context(request: Request) -> JSONResponse:
     if _payment_mode == "unconfigured":
         return _payment_gate_error()
     result = await _video_context_request(request.query_params.get("video", ""))
-    return JSONResponse(result)
+    return _rest_response(result)
 
 
 @mcp.custom_route(config.PAID_RADAR_PATH, methods=["GET"])
@@ -1003,14 +1079,14 @@ async def paid_rising_channels(request: Request) -> JSONResponse:
         recency_days = _int_param(params, "recency_days", config.RECENCY_DAYS_DEFAULT)
         max_subs = _int_param(params, "max_subs", config.RADAR_MAX_SUBS_DEFAULT)
     except ToolFault as fault:
-        return JSONResponse(fault.to_response())
+        return _rest_response(fault.to_response())
     result = await _radar_request(
         params.get("niche", ""),
         params.get("region_code", config.DEFAULT_REGION_CODE),
         recency_days,
         max_subs,
     )
-    return JSONResponse(result)
+    return _rest_response(result)
 
 
 @mcp.custom_route("/healthz", methods=["GET"])

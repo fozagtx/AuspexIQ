@@ -50,6 +50,7 @@ def recent_median_baseline(uploads, now):
         and v["published_at"] is not None
         and v["published_at"] < cutoff
         and not is_short(v["seconds"])
+        and not v.get("stream")  # cumulative stream views would poison the median
     ]
     if len(qualifying) < config.BASELINE_MIN_VIDEOS:
         return None
@@ -92,9 +93,27 @@ def assess_niche(videos, outlier_records, now):
     Returns (saturation, verdict, reasons, signals).
     """
     n = len(videos)
+    if n == 0:
+        # no qualifying videos: an honest no-data state, never a scored verdict
+        return (
+            None,
+            "NO_DATA",
+            [
+                "no qualifying long-form videos were found for this query in the "
+                "recency window, so no saturation score or entry verdict can be "
+                "computed; try a broader query or a longer recency window"
+            ],
+            {
+                "channel_diversity": None,
+                "top3_view_concentration": None,
+                "fresh_share_90d": None,
+                "small_channel_outliers": 0,
+            },
+        )
+
     unique_channels = {v["channel_id"] for v in videos}
     u = len(unique_channels)
-    diversity = u / n if n else 0.0
+    diversity = u / n
 
     views_by_channel = defaultdict(int)
     for v in videos:
@@ -151,18 +170,21 @@ def assess_niche(videos, outlier_records, now):
         lead = " and ".join(parts)
     else:
         verdict = "CROWDED"
-        lead = (
-            f"saturation {saturation}/100 sits between "
-            f"{config.VERDICT_ENTER_MAX_SATURATION} and "
-            f"{config.VERDICT_AVOID_MIN_SATURATION}; established channels dominate "
-            f"but the niche is not closed"
-        )
+        if saturation <= config.VERDICT_ENTER_MAX_SATURATION:
+            lead = (
+                f"saturation {saturation}/100 is moderate, but only {sw} "
+                f"small-channel breakout(s) cleared the bar; ENTER needs at least "
+                f"{config.VERDICT_ENTER_MIN_SMALL_OUTLIERS}"
+            )
+        else:
+            lead = (
+                f"saturation {saturation}/100 sits between "
+                f"{config.VERDICT_ENTER_MAX_SATURATION} and "
+                f"{config.VERDICT_AVOID_MIN_SATURATION}; established channels "
+                f"dominate but the niche is not closed"
+            )
 
     reasons = [lead]
-    if n == 0:
-        reasons.append(
-            "no qualifying long-form videos were found for this query in the recency window"
-        )
     reasons.extend(
         [
             f"{u} unique channels across {n} analyzed videos",

@@ -216,7 +216,10 @@ async def search_videos(query, region_code, published_after_iso, max_results, me
 async def list_videos(video_ids, meter):
     return await _get(
         "videos",
-        {"part": "snippet,statistics,contentDetails", "id": ",".join(video_ids)},
+        {
+            "part": "snippet,statistics,contentDetails,liveStreamingDetails",
+            "id": ",".join(video_ids),
+        },
         config.COST_LIST,
         meter,
     )
@@ -252,19 +255,22 @@ async def playlist_page(playlist_id, max_results, page_token, meter):
 
 
 def normalize_video(item):
-    """Flatten a videos.list item. views is None when the count is hidden."""
+    """Flatten a videos.list item. views is None when the count is hidden.
+    stream is True for live, upcoming, and past live broadcasts."""
     snippet = item.get("snippet", {})
     stats = item.get("statistics", {})
     seconds = analysis.duration_seconds(item.get("contentDetails", {}).get("duration"))
     published = snippet.get("publishedAt")
     return {
         "id": item.get("id", ""),
-        "title": snippet.get("title", ""),
+        "title": snippet.get("title", "").strip(),
         "channel_id": snippet.get("channelId", ""),
-        "channel_title": snippet.get("channelTitle", ""),
+        "channel_title": snippet.get("channelTitle", "").strip(),
         "published_at": analysis.parse_timestamp(published) if published else None,
         "views": int(stats["viewCount"]) if "viewCount" in stats else None,
         "seconds": seconds,
+        "stream": snippet.get("liveBroadcastContent") in ("live", "upcoming")
+        or "liveStreamingDetails" in item,
     }
 
 
@@ -275,7 +281,7 @@ def normalize_channel(item):
     hidden = stats.get("hiddenSubscriberCount", False)
     return {
         "id": item.get("id", ""),
-        "title": snippet.get("title", ""),
+        "title": snippet.get("title", "").strip(),
         "subs": None if hidden else int(stats.get("subscriberCount", 0)),
         "view_count": int(stats.get("viewCount", 0)),
         "video_count": int(stats.get("videoCount", 0)),
