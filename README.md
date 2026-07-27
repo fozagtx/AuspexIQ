@@ -67,7 +67,7 @@ pay and retry automatically:
 
 - `GET /paid/scan_niche?query=...` — 0.1 USDT/call
 - `GET /paid/channel_outliers?channel=...` — 0.1 USDT/call
-- `GET /paid/video_context?video=...` — 0.05 USDT/call, why a video over/under-performed
+- `GET /paid/video_context?video=...` — FREE, why a video over/under-performed
 - `GET /paid/rising_channels?niche=...&max_subs=500000` — 0.25 USDT/call, fastest-rising channels
 
 Responses are identical to the corresponding MCP tools. Payment schemes:

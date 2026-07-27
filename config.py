@@ -60,7 +60,7 @@ MIN_MULTIPLE_MAX = 10.0
 PAYMENTS_ENABLED_ENV = "PAYMENTS_ENABLED"  # "false" serves the /paid routes free
 PAID_PRICE_SCAN_USDT = "0.1"     # per-call price: scan_niche
 PAID_PRICE_CHANNEL_USDT = "0.1"  # per-call price: channel_outliers
-PAID_PRICE_VIDEO_USDT = "0.05"   # per-call price: video_context
+PAID_PRICE_VIDEO_USDT = "0"      # per-call price: video_context ("0" = free, route not gated)
 PAID_PRICE_RADAR_USDT = "0.25"   # per-call price: rising_channels
 X402_NETWORK = "eip155:196"      # X Layer (USDT, 6 decimals)
 PAID_SCAN_PATH = "/paid/scan_niche"

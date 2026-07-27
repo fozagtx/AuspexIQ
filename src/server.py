@@ -1084,27 +1084,32 @@ def _build_app():
             ),
         ]
 
+    priced = {
+        config.PAID_SCAN_PATH: (
+            config.PAID_PRICE_SCAN_USDT,
+            "Live YouTube niche scan: saturation, outliers, ENTER/CROWDED/AVOID verdict",
+        ),
+        config.PAID_CHANNEL_PATH: (
+            config.PAID_PRICE_CHANNEL_USDT,
+            "Live YouTube channel outlier audit vs the channel's own baseline",
+        ),
+        config.PAID_VIDEO_PATH: (
+            config.PAID_PRICE_VIDEO_USDT,
+            "Explain any YouTube video's performance vs its own channel's baseline",
+        ),
+        config.PAID_RADAR_PATH: (
+            config.PAID_PRICE_RADAR_USDT,
+            "Fastest-rising channels in a YouTube niche by recent-vs-lifetime momentum",
+        ),
+    }
+    # a "0" price means the service is free: leave its route out of the payment
+    # gate so it returns the result directly, per the marketplace contract
     routes = {
-        f"GET {config.PAID_SCAN_PATH}": RouteConfig(
-            accepts=options(config.PAID_PRICE_SCAN_USDT),
-            description="Live YouTube niche scan: saturation, outliers, ENTER/CROWDED/AVOID verdict",
-            mime_type="application/json",
-        ),
-        f"GET {config.PAID_CHANNEL_PATH}": RouteConfig(
-            accepts=options(config.PAID_PRICE_CHANNEL_USDT),
-            description="Live YouTube channel outlier audit vs the channel's own baseline",
-            mime_type="application/json",
-        ),
-        f"GET {config.PAID_VIDEO_PATH}": RouteConfig(
-            accepts=options(config.PAID_PRICE_VIDEO_USDT),
-            description="Explain any YouTube video's performance vs its own channel's baseline",
-            mime_type="application/json",
-        ),
-        f"GET {config.PAID_RADAR_PATH}": RouteConfig(
-            accepts=options(config.PAID_PRICE_RADAR_USDT),
-            description="Fastest-rising channels in a YouTube niche by recent-vs-lifetime momentum",
-            mime_type="application/json",
-        ),
+        f"GET {path}": RouteConfig(
+            accepts=options(price), description=description, mime_type="application/json"
+        )
+        for path, (price, description) in priced.items()
+        if float(price) > 0
     }
     application.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
     _payment_mode = "enforced"
